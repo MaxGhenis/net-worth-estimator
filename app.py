@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date
 from typing import Any
 
@@ -318,6 +319,7 @@ def event_model(events: pd.DataFrame) -> pd.DataFrame:
 def compound_stream(row: pd.Series, scenario: str, valuation_year: int) -> float:
     start_year = int(safe_number(row.get("Start year"), valuation_year))
     end_year = int(safe_number(row.get("End year"), start_year))
+    end_year = min(end_year, valuation_year)
     if end_year < start_year:
         return 0.0
 
@@ -371,6 +373,18 @@ def asset_model(assets: pd.DataFrame) -> pd.DataFrame:
 def combine_drivers(
     events: pd.DataFrame, comp_streams: pd.DataFrame, assets: pd.DataFrame, valuation_year: int
 ) -> pd.DataFrame:
+    output_columns = [
+        "Driver",
+        "Type",
+        "Source ID",
+        "Confidence",
+        "Notes",
+        "Low current ($m)",
+        "Base current ($m)",
+        "High current ($m)",
+        "Confidence score",
+        "Sensitivity spread ($m)",
+    ]
     frames = [
         event_model(events),
         comp_model(comp_streams, valuation_year),
@@ -378,24 +392,13 @@ def combine_drivers(
     ]
     non_empty = [frame for frame in frames if not frame.empty]
     if not non_empty:
-        return pd.DataFrame(
-            columns=[
-                "Driver",
-                "Type",
-                "Source ID",
-                "Confidence",
-                "Notes",
-                "Low current ($m)",
-                "Base current ($m)",
-                "High current ($m)",
-            ]
-        )
+        return pd.DataFrame(columns=output_columns)
     result = pd.concat(non_empty, ignore_index=True)
     result["Confidence score"] = result["Confidence"].map(confidence_score)
     result["Sensitivity spread ($m)"] = (
         result["High current ($m)"] - result["Low current ($m)"]
     )
-    return result
+    return result.reindex(columns=output_columns)
 
 
 def summarize(drivers: pd.DataFrame, haircuts: dict[str, float]) -> pd.DataFrame:
@@ -475,8 +478,16 @@ def dataframe_for_download(
     comp_streams: pd.DataFrame,
     assets: pd.DataFrame,
     sources: pd.DataFrame,
+    valuation_date: date,
+    threshold: float,
+    haircuts: dict[str, float],
 ) -> str:
     payload = {
+        "metadata": {
+            "valuation_date": valuation_date.isoformat(),
+            "threshold_m": threshold,
+            "global_haircuts": haircuts,
+        },
         "summary": summary.to_dict(orient="records"),
         "drivers": drivers.to_dict(orient="records"),
         "events": events.to_dict(orient="records"),
@@ -484,7 +495,33 @@ def dataframe_for_download(
         "assets": assets.to_dict(orient="records"),
         "sources": sources.to_dict(orient="records"),
     }
-    return json.dumps(payload, indent=2)
+    return json.dumps(json_ready(payload), indent=2, allow_nan=False)
+
+
+def json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_ready(item) for item in value]
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, int | str | bool) or value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            return json_ready(value.item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
 
 
 def style_app() -> None:
@@ -504,21 +541,16 @@ def style_app() -> None:
             margin-bottom: 0.2rem;
         }
         [data-testid="stMetric"] {
-            background: rgba(255, 255, 255, 0.045);
-            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(127, 127, 127, 0.08);
+            border: 1px solid rgba(127, 127, 127, 0.22);
             padding: 0.75rem 0.9rem;
         }
-        [data-testid="stMetricLabel"] {
-            color: rgba(255, 255, 255, 0.72);
-        }
-        [data-testid="stMetricValue"] {
-            color: rgba(255, 255, 255, 0.96);
-        }
         div[data-testid="stDataFrame"] {
-            border: 1px solid rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(127, 127, 127, 0.22);
         }
         .small-note {
-            color: rgba(255, 255, 255, 0.62);
+            color: inherit;
+            opacity: 0.72;
             font-size: 0.9rem;
             line-height: 1.35;
         }
@@ -680,7 +712,7 @@ def render_driver_tables(drivers: pd.DataFrame) -> None:
         },
     )
 
-    top_sensitivity = visible.head(8).sort_values("Sensitivity spread ($m)")
+    top_sensitivity = top_sensitivity_rows(visible)
     fig = go.Figure(
         go.Bar(
             x=top_sensitivity["Sensitivity spread ($m)"],
@@ -697,6 +729,18 @@ def render_driver_tables(drivers: pd.DataFrame) -> None:
         yaxis_title=None,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def top_sensitivity_rows(drivers: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+    if drivers.empty:
+        return drivers.copy()
+    ranked = drivers.copy()
+    ranked["Sensitivity spread ($m)"] = pd.to_numeric(
+        ranked["Sensitivity spread ($m)"], errors="coerce"
+    ).fillna(0)
+    return ranked.nlargest(limit, "Sensitivity spread ($m)").sort_values(
+        "Sensitivity spread ($m)"
+    )
 
 
 def main() -> None:
@@ -840,6 +884,9 @@ def main() -> None:
                 st.session_state.comp_streams,
                 st.session_state.assets,
                 st.session_state.sources,
+                valuation_date,
+                threshold,
+                haircuts,
             ),
             file_name="assumption-ledger-model.json",
             mime="application/json",

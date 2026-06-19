@@ -28,6 +28,12 @@ uv pip install -r requirements.txt
 uv run streamlit run app.py
 ```
 
+## Test
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
 ## Notes
 
 The bundled sample is a founder/executive-style model based on public deal
